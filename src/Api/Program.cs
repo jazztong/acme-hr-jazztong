@@ -1,5 +1,6 @@
 using Api.Auth;
 using Api.Data;
+using Api.Mcp;
 using Api.Services;
 using Microsoft.EntityFrameworkCore;
 
@@ -25,6 +26,13 @@ builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(o => o.AddAcmeAuth());
 builder.Services.AddAcmeAuth();
 
+// MCP connector for claude.ai: OAuth 2.1 (dynamic client registration + PKCE) and read-only tools at /mcp.
+builder.Services.AddMcpOAuth();
+builder.Services.AddHttpContextAccessor();
+builder.Services.AddMcpServer(o => o.ServerInfo = new() { Name = "acme-hr", Version = "1.0.0" })
+    .WithHttpTransport(o => o.Stateless = true)
+    .WithTools<HrTools>();
+
 var origins = (builder.Configuration["AllowedOrigins"] ?? "http://localhost:3000").Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
 builder.Services.AddCors(o => o.AddDefaultPolicy(p => p.WithOrigins(origins).AllowAnyHeader().AllowAnyMethod()));
 
@@ -34,6 +42,7 @@ using (var scope = app.Services.CreateScope())
 {
     var db = scope.ServiceProvider.GetRequiredService<AcmeDb>();
     db.Database.EnsureCreated();
+    McpOAuth.EnsureKey(db); // its own table, created if missing: EnsureCreated does not add tables to an existing database
     Seed.Run(db);
     var postgres = !string.IsNullOrWhiteSpace(pg);
     SeedLogins.Run(db, SeedLogins.PasswordFor(postgres, builder.Configuration["SEED_USER_PASSWORD"]));
@@ -41,16 +50,20 @@ using (var scope = app.Services.CreateScope())
         throw new InvalidOperationException("This Postgres database was seeded with the public training password Acme@2026. Recreate the database (or change the passwords) before using it: the app would be open to anyone who reads the README.");
 }
 
+app.UseForwardedHeaders(); // https and the public host behind Render's proxy, for the OAuth metadata URLs
 app.UseCors();
 app.UseDefaultFiles();   // /app/ -> /app/index.html: on Render the web app is built into wwwroot/app (see src/Api/Dockerfile)
 app.UseStaticFiles();
 app.MapGet("/", () => Results.Redirect("/app/")).ExcludeFromDescription();
 app.UseAuthentication();
 app.UseAuthorization();
+app.UseRateLimiter();
 app.UseSwagger();
 app.UseSwaggerUI();
 app.MapAcmeAuth();
 app.MapControllers().RequireAuthorization(); // signed in by default; opt out with [AllowAnonymous]
+app.MapMcpOAuth();                                        // anonymous OAuth endpoints only (approved): metadata, register, authorize, token
+app.MapMcp("/mcp").RequireAuthorization(McpOAuth.Policy); // MCP needs an access token for this server
 app.Run();
 
 public partial class Program { }
